@@ -1,0 +1,16 @@
+{
+  "Profile": "default",
+  "ProjectId": "",
+  "InstanceName": "",
+  "ProcessorName": "test-processor-3",
+  "Pipeline": "[{\"$match\": {\"status\": \"active\"}}]",
+  "State": "CREATED",
+  "Options": {
+    "Dlq": {
+      "Coll": "dlq-collection",
+      "ConnectionName": "",
+      "Db": "dlq-database"
+    }
+  },
+  "ClusterName": ""
+}

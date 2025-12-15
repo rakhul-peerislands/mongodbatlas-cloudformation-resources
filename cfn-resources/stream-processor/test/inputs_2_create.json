@@ -1,0 +1,12 @@
+{
+  "Profile": "default",
+  "ProjectId": "",
+  "WorkspaceName": "",
+  "ProcessorName": "test-processor-2",
+  "Pipeline": "[{\"$match\": {\"status\": \"active\"}}]",
+  "State": "STARTED",
+  "Timeouts": {
+    "Create": "25m"
+  },
+  "DeleteOnCreateTimeout": true
+}

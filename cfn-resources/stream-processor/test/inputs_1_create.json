@@ -1,0 +1,8 @@
+{
+  "Profile": "default",
+  "ProjectId": "",
+  "WorkspaceName": "",
+  "ProcessorName": "test-processor-1",
+  "Pipeline": "[{\"$match\": {\"status\": \"active\"}}]",
+  "State": "CREATED"
+}
