@@ -6,7 +6,7 @@
   "RoleAssignments": [
     {
       "Role": "GROUP_DATA_ACCESS_READ_WRITE",
-      "ProjectId": ""
+      "GroupId": ""
     }
   ]
 }

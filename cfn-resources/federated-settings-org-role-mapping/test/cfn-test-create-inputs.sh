@@ -44,7 +44,7 @@ for inputFile in inputs_*; do
 		--arg FederationSettingsId "$ATLAS_FEDERATED_SETTINGS_ID" \
 		--arg projectId "$projectId" \
 		--arg profile "$profile" \
-		'.Profile?|=$profile | .FederationSettingsId?|=$FederationSettingsId | .OrgId?|=$org | .RoleAssignments[0].ProjectId?|=$projectId' \
+		'.Profile?|=$profile | .FederationSettingsId?|=$FederationSettingsId | .OrgId?|=$org | .RoleAssignments[0].GroupId?|=$projectId' \
 		"$inputFile" >"../inputs/$outputFile"
 done
 cd ..
