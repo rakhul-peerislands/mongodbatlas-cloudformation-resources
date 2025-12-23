@@ -1,9 +1,10 @@
 {
   "Profile": "default",
   "ProjectId": "",
+  "WorkspaceName": "",
   "InstanceName": "",
   "ProcessorName": "test-processor-3",
-  "Pipeline": "[{\"$match\": {\"status\": \"active\"}}]",
+  "Pipeline": "[{\"$source\": {\"connectionName\": \"CONNECTION_NAME_PLACEHOLDER\"}}, {\"$merge\": {\"into\": {\"connectionName\": \"CONNECTION_NAME_PLACEHOLDER\", \"db\": \"test\", \"coll\": \"output\"}}}]",
   "State": "CREATED",
   "Options": {
     "Dlq": {
@@ -11,6 +12,5 @@
       "ConnectionName": "",
       "Db": "dlq-database"
     }
-  },
-  "ClusterName": ""
+  }
 }

@@ -1,7 +1,11 @@
-.PHONY: build test clean
+.PHONY: build debug test clean
 
 build:
 	make -f makebuild  # this runs build steps required by the cfn cli
+
+debug:
+	cfn generate
+	env GOOS=linux go build -ldflags="-s -w" -tags="lambda.norpc,$(TAGS)" -o bin/bootstrap cmd/main.go
 
 test:
 	cfn generate

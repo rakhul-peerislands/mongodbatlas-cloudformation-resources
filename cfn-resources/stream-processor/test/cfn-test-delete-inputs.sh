@@ -28,6 +28,17 @@ for processorName in "$processorName1" "$processorName2" "$processorName3"; do
 	fi
 done
 
+# Delete Sample connection (sample_stream_solar) if it exists
+sampleConnectionName="sample_stream_solar"
+if atlas streams connections delete "${sampleConnectionName}" \
+	--projectId "${projectId}" \
+	--instance "${workspaceName}" \
+	--force 2>/dev/null; then
+	echo "deleted sample stream connection with name ${sampleConnectionName}"
+else
+	echo "failed to delete or sample stream connection '${sampleConnectionName}' does not exist"
+fi
+
 # Get connection name from inputs_3 if it exists
 if [ -f "./inputs/inputs_3_create.json" ]; then
 	connectionName=$(jq -r '.Options.Dlq.ConnectionName // empty' ./inputs/inputs_3_create.json)

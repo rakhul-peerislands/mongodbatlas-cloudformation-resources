@@ -191,7 +191,8 @@ func TestCopyIdentifyingFields(t *testing.T) {
 				assert.Equal(t, "507f1f77bcf86cd799439011", util.SafeString(rm.ProjectId))
 				assert.Equal(t, "processor-1", util.SafeString(rm.ProcessorName))
 				assert.Equal(t, "workspace-1", util.SafeString(rm.WorkspaceName))
-				assert.Nil(t, rm.InstanceName)
+				// Primary identifier requires both fields - InstanceName should be set from WorkspaceName
+				assert.Equal(t, "workspace-1", util.SafeString(rm.InstanceName))
 			},
 		},
 		"withInstanceName": {
@@ -207,7 +208,8 @@ func TestCopyIdentifyingFields(t *testing.T) {
 				assert.Equal(t, "507f1f77bcf86cd799439011", util.SafeString(rm.ProjectId))
 				assert.Equal(t, "processor-1", util.SafeString(rm.ProcessorName))
 				assert.Equal(t, "instance-1", util.SafeString(rm.InstanceName))
-				assert.Nil(t, rm.WorkspaceName)
+				// Primary identifier requires both fields - WorkspaceName should be set from InstanceName
+				assert.Equal(t, "instance-1", util.SafeString(rm.WorkspaceName))
 			},
 		},
 		"emptyWorkspaceName": {
@@ -1204,6 +1206,17 @@ func TestHandleUpdateCallback(t *testing.T) {
 					State: StartedState,
 				}
 				m.EXPECT().GetStreamProcessorExecute(mock.Anything).Return(processor, &http.Response{StatusCode: 200}, nil)
+
+				// When state is already STARTED and planned state is STARTED, code still calls UpdateStreamProcessorWithParams
+				// to allow updates to other fields (like Pipeline)
+				updateReq := admin20250312010.UpdateStreamProcessorApiRequest{ApiService: m}
+				m.EXPECT().UpdateStreamProcessorWithParams(mock.Anything, mock.Anything).Return(updateReq)
+				updatedProcessor := &admin20250312010.StreamsProcessorWithStats{
+					Name:  "processor-1",
+					Id:    "507f1f77bcf86cd799439011",
+					State: StartedState,
+				}
+				m.EXPECT().UpdateStreamProcessorExecute(mock.Anything).Return(updatedProcessor, &http.Response{StatusCode: 200}, nil)
 			},
 			expectedStatus: handler.Success,
 		},

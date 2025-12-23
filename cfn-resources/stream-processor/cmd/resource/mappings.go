@@ -18,7 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	admin20250312010 "go.mongodb.org/atlas-sdk/v20250312010/admin"
+	"go.mongodb.org/atlas-sdk/v20250312010/admin"
 
 	"github.com/mongodb/mongodbatlas-cloudformation-resources/util"
 )
@@ -26,8 +26,9 @@ import (
 // GetWorkspaceOrInstanceName returns the workspace name from workspace_name or instance_name field.
 // Uses precedence logic: WorkspaceName takes precedence over InstanceName if both are provided.
 // This follows CFN guidelines where mutual exclusivity is handled via precedence, not validation errors.
+// CloudFormation does not support hard validation of mutual exclusivity (like Terraform's ConflictsWith),
+// so both fields can be present in the input. The handler uses precedence to determine which value to use.
 func GetWorkspaceOrInstanceName(model *Model) (string, error) {
-	// Precedence: WorkspaceName takes precedence over InstanceName
 	if model.WorkspaceName != nil && *model.WorkspaceName != "" {
 		return *model.WorkspaceName, nil
 	}
@@ -69,24 +70,29 @@ func ConvertStatsToString(stats any) (string, error) {
 }
 
 // NewStreamProcessorReq creates an API request from CloudFormation model
-func NewStreamProcessorReq(model *Model) (*admin20250312010.StreamsProcessor, error) {
+func NewStreamProcessorReq(model *Model) (*admin.StreamsProcessor, error) {
 	pipeline, err := ConvertPipelineToSdk(util.SafeString(model.Pipeline))
 	if err != nil {
 		return nil, err
 	}
 
-	streamProcessor := &admin20250312010.StreamsProcessor{
+	streamProcessor := &admin.StreamsProcessor{
 		Name:     model.ProcessorName,
 		Pipeline: &pipeline,
 	}
 
 	if model.Options != nil && model.Options.Dlq != nil {
-		streamProcessor.Options = &admin20250312010.StreamsOptions{
-			Dlq: &admin20250312010.StreamsDLQ{
-				Coll:           model.Options.Dlq.Coll,
-				ConnectionName: model.Options.Dlq.ConnectionName,
-				Db:             model.Options.Dlq.Db,
-			},
+		dlq := model.Options.Dlq
+		if dlq.Coll != nil && *dlq.Coll != "" &&
+			dlq.ConnectionName != nil && *dlq.ConnectionName != "" &&
+			dlq.Db != nil && *dlq.Db != "" {
+			streamProcessor.Options = &admin.StreamsOptions{
+				Dlq: &admin.StreamsDLQ{
+					Coll:           dlq.Coll,
+					ConnectionName: dlq.ConnectionName,
+					Db:             dlq.Db,
+				},
+			}
 		}
 	}
 
@@ -94,7 +100,7 @@ func NewStreamProcessorReq(model *Model) (*admin20250312010.StreamsProcessor, er
 }
 
 // NewStreamProcessorUpdateReq creates an update API request from CloudFormation model
-func NewStreamProcessorUpdateReq(model *Model) (*admin20250312010.UpdateStreamProcessorApiParams, error) {
+func NewStreamProcessorUpdateReq(model *Model) (*admin.UpdateStreamProcessorApiParams, error) {
 	pipeline, err := ConvertPipelineToSdk(util.SafeString(model.Pipeline))
 	if err != nil {
 		return nil, err
@@ -105,44 +111,58 @@ func NewStreamProcessorUpdateReq(model *Model) (*admin20250312010.UpdateStreamPr
 		return nil, err
 	}
 
-	streamProcessorAPIParams := &admin20250312010.UpdateStreamProcessorApiParams{
+	streamProcessorAPIParams := &admin.UpdateStreamProcessorApiParams{
 		GroupId:       util.SafeString(model.ProjectId),
 		TenantName:    workspaceOrInstanceName,
 		ProcessorName: util.SafeString(model.ProcessorName),
-		StreamsModifyStreamProcessor: &admin20250312010.StreamsModifyStreamProcessor{
+		StreamsModifyStreamProcessor: &admin.StreamsModifyStreamProcessor{
 			Name:     model.ProcessorName,
 			Pipeline: &pipeline,
 		},
 	}
 
 	if model.Options != nil && model.Options.Dlq != nil {
-		streamProcessorAPIParams.StreamsModifyStreamProcessor.Options = &admin20250312010.StreamsModifyStreamProcessorOptions{
-			Dlq: &admin20250312010.StreamsDLQ{
-				Coll:           model.Options.Dlq.Coll,
-				ConnectionName: model.Options.Dlq.ConnectionName,
-				Db:             model.Options.Dlq.Db,
-			},
+		dlq := model.Options.Dlq
+		if dlq.Coll != nil && *dlq.Coll != "" &&
+			dlq.ConnectionName != nil && *dlq.ConnectionName != "" &&
+			dlq.Db != nil && *dlq.Db != "" {
+			streamProcessorAPIParams.StreamsModifyStreamProcessor.Options = &admin.StreamsModifyStreamProcessorOptions{
+				Dlq: &admin.StreamsDLQ{
+					Coll:           dlq.Coll,
+					ConnectionName: dlq.ConnectionName,
+					Db:             dlq.Db,
+				},
+			}
 		}
 	}
 
 	return streamProcessorAPIParams, nil
 }
 
-// GetStreamProcessorModel converts API response to CloudFormation model
-func GetStreamProcessorModel(streamProcessor *admin20250312010.StreamsProcessorWithStats, currentModel *Model) (*Model, error) {
+// GetStreamProcessorModel converts API response to CloudFormation model.
+// This function preserves primary identifier fields from currentModel to ensure CloudFormation
+// can properly track the resource. The primary identifier includes:
+// - ProjectId
+// - WorkspaceName and InstanceName (both must be present for backward/forward compatibility)
+// - ProcessorName
+// - Profile
+// Note: This function does NOT set primary identifier fields directly - that is handled by
+// copyIdentifyingFields() which is called after GetStreamProcessorModel() in handlers.
+func GetStreamProcessorModel(streamProcessor *admin.StreamsProcessorWithStats, currentModel *Model) (*Model, error) {
 	model := new(Model)
 
 	if currentModel != nil {
-		model = currentModel
+		*model = *currentModel
+		model.DeleteOnCreateTimeout = nil
 	}
 
-	// Set basic fields
 	model.ProcessorName = util.Pointer(streamProcessor.Name)
 	model.Id = util.Pointer(streamProcessor.Id)
 	model.State = util.Pointer(streamProcessor.State)
 
-	// Convert pipeline
-	if streamProcessor.Pipeline != nil {
+	if currentModel != nil && currentModel.Pipeline != nil {
+		model.Pipeline = currentModel.Pipeline
+	} else if streamProcessor.Pipeline != nil {
 		pipelineStr, err := ConvertPipelineToString(streamProcessor.GetPipeline())
 		if err != nil {
 			return nil, err
@@ -150,7 +170,6 @@ func GetStreamProcessorModel(streamProcessor *admin20250312010.StreamsProcessorW
 		model.Pipeline = &pipelineStr
 	}
 
-	// Convert stats
 	if streamProcessor.Stats != nil {
 		statsStr, err := ConvertStatsToString(streamProcessor.GetStats())
 		if err != nil {
@@ -159,19 +178,27 @@ func GetStreamProcessorModel(streamProcessor *admin20250312010.StreamsProcessorW
 		model.Stats = &statsStr
 	}
 
-	// Convert options
 	if streamProcessor.Options != nil && streamProcessor.Options.Dlq != nil {
-		model.Options = &StreamsOptions{
-			Dlq: &StreamsDLQ{
-				Coll:           streamProcessor.Options.Dlq.Coll,
-				ConnectionName: streamProcessor.Options.Dlq.ConnectionName,
-				Db:             streamProcessor.Options.Dlq.Db,
-			},
+		apiDlq := streamProcessor.Options.Dlq
+		if apiDlq.Coll != nil && *apiDlq.Coll != "" &&
+			apiDlq.ConnectionName != nil && *apiDlq.ConnectionName != "" &&
+			apiDlq.Db != nil && *apiDlq.Db != "" {
+			model.Options = &StreamsOptions{
+				Dlq: &StreamsDLQ{
+					Coll:           apiDlq.Coll,
+					ConnectionName: apiDlq.ConnectionName,
+					Db:             apiDlq.Db,
+				},
+			}
 		}
 	} else {
-		// If no options in response, preserve current model's options if it exists
-		if currentModel != nil && currentModel.Options != nil {
-			model.Options = currentModel.Options
+		if currentModel != nil && currentModel.Options != nil && currentModel.Options.Dlq != nil {
+			currentDlq := currentModel.Options.Dlq
+			if currentDlq.Coll != nil && *currentDlq.Coll != "" &&
+				currentDlq.ConnectionName != nil && *currentDlq.ConnectionName != "" &&
+				currentDlq.Db != nil && *currentDlq.Db != "" {
+				model.Options = currentModel.Options
+			}
 		}
 	}
 

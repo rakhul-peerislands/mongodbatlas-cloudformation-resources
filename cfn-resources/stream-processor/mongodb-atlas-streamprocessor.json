@@ -103,6 +103,7 @@
   "additionalProperties": false,
   "required": ["ProjectId", "ProcessorName", "Pipeline"],
   "readOnlyProperties": ["/properties/Id", "/properties/Stats"],
+  "writeOnlyProperties": ["/properties/DeleteOnCreateTimeout"],
   "primaryIdentifier": [
     "/properties/ProjectId",
     "/properties/InstanceName",

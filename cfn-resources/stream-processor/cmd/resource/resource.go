@@ -12,6 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package resource implements the CloudFormation resource handler for MongoDB::Atlas::StreamProcessor.
+// This resource enables creating, reading, updating, and deleting Atlas Stream Processors via AWS CloudFormation.
+//
+// Key features:
+//   - Supports both WorkspaceName (preferred) and InstanceName (deprecated) for backward compatibility
+//   - Uses precedence logic for WorkspaceName/InstanceName (WorkspaceName takes precedence if both provided)
+//   - Implements callback-based state management for long-running operations (processor creation/startup)
+//   - Preserves primary identifier fields (ProjectId, WorkspaceName, InstanceName, ProcessorName, Profile) in all responses
+//   - Handles write-only properties (DeleteOnCreateTimeout) correctly
+//   - Supports timeout configuration and automatic cleanup on timeout
+//
+// Primary identifier fields must be present in all returned models to ensure CloudFormation can properly track resources.
+// The copyIdentifyingFields() helper function ensures both WorkspaceName and InstanceName are set for backward/forward compatibility.
 package resource
 
 import (
@@ -22,6 +35,8 @@ import (
 	"net/http"
 	"time"
 
+	"go.mongodb.org/atlas-sdk/v20250312010/admin"
+
 	"github.com/aws-cloudformation/cloudformation-cli-go-plugin/cfn/handler"
 
 	"github.com/mongodb/mongodbatlas-cloudformation-resources/util"
@@ -29,7 +44,6 @@ import (
 	"github.com/mongodb/mongodbatlas-cloudformation-resources/util/logger"
 	"github.com/mongodb/mongodbatlas-cloudformation-resources/util/progressevent"
 	"github.com/mongodb/mongodbatlas-cloudformation-resources/util/validator"
-	admin20250312010 "go.mongodb.org/atlas-sdk/v20250312010/admin"
 )
 
 const (
@@ -44,7 +58,7 @@ const (
 
 const (
 	defaultCallbackDelaySeconds = 3
-	defaultCreateTimeout        = 20 * time.Minute // Default 20 minutes like Terraform
+	defaultCreateTimeout        = 20 * time.Minute
 )
 
 func setup() {
@@ -56,8 +70,7 @@ var ReadRequiredFields = []string{constants.ProjectID, constants.ProcessorName}
 var UpdateRequiredFields = []string{constants.ProjectID, constants.ProcessorName, constants.Pipeline}
 var DeleteRequiredFields = []string{constants.ProjectID, constants.ProcessorName}
 
-// initEnvWithLatestClient is a variable that can be swapped in tests for mocking
-var initEnvWithLatestClient = func(req handler.Request, currentModel *Model, requiredFields []string) (*admin20250312010.APIClient, *handler.ProgressEvent) {
+var initEnvWithLatestClient = func(req handler.Request, currentModel *Model, requiredFields []string) (*admin.APIClient, *handler.ProgressEvent) {
 	setup()
 	util.SetDefaultProfileIfNotDefined(&currentModel.Profile)
 
@@ -79,8 +92,8 @@ type callbackData struct {
 	ProcessorName           string
 	NeedsStarting           bool
 	PlannedState            string
-	StartTime               string // ISO 8601 timestamp when operation started
-	TimeoutDuration         string // Duration string (e.g., "20m")
+	StartTime               string
+	TimeoutDuration         string
 	DeleteOnCreateTimeout   bool
 }
 
@@ -94,7 +107,6 @@ func isCallback(req *handler.Request) bool {
 func getCallbackData(req handler.Request) *callbackData {
 	ctx := &callbackData{}
 
-	// Extract values from callback context
 	if val, ok := req.CallbackContext["projectID"].(string); ok {
 		ctx.ProjectID = val
 	}
@@ -136,6 +148,7 @@ func validateCallbackData(ctx *callbackData) *handler.ProgressEvent {
 
 // copyIdentifyingFields copies identifying fields from currentModel to resourceModel
 // This ensures CloudFormation can properly track the resource using primaryIdentifier fields
+// NOTE: Primary identifier includes both InstanceName and WorkspaceName, so we must set both
 func copyIdentifyingFields(resourceModel, currentModel *Model) {
 	resourceModel.Profile = currentModel.Profile
 	resourceModel.ProjectId = currentModel.ProjectId
@@ -143,23 +156,25 @@ func copyIdentifyingFields(resourceModel, currentModel *Model) {
 
 	if currentModel.WorkspaceName != nil && *currentModel.WorkspaceName != "" {
 		resourceModel.WorkspaceName = currentModel.WorkspaceName
-		resourceModel.InstanceName = nil
-	} else {
+		resourceModel.InstanceName = util.Pointer(*currentModel.WorkspaceName)
+	} else if currentModel.InstanceName != nil && *currentModel.InstanceName != "" {
 		resourceModel.InstanceName = currentModel.InstanceName
-		resourceModel.WorkspaceName = nil
+		resourceModel.WorkspaceName = util.Pointer(*currentModel.InstanceName)
+	} else {
+		resourceModel.WorkspaceName = currentModel.WorkspaceName
+		resourceModel.InstanceName = currentModel.InstanceName
 	}
 }
 
 // buildCallbackContext creates a callback context map for InProgress events
 func buildCallbackContext(projectID, workspaceOrInstanceName, processorName string, additionalFields map[string]any) map[string]any {
 	ctx := map[string]any{
-		"callbackStreamProcessor": true, // Callback marker (similar to cluster's pattern)
+		"callbackStreamProcessor": true,
 		"projectID":               projectID,
 		"workspaceName":           workspaceOrInstanceName,
 		"processorName":           processorName,
 	}
 
-	// Merge additional fields
 	maps.Copy(ctx, additionalFields)
 
 	return ctx
@@ -196,22 +211,19 @@ func isTimeoutExceeded(startTimeStr, timeoutDurationStr string) bool {
 	return elapsed >= timeoutDuration
 }
 
-// cleanupOnCreateTimeout deletes the resource if timeout occurred and DeleteOnCreateTimeout is true
-func cleanupOnCreateTimeout(ctx context.Context, atlasClient *admin20250312010.APIClient, callbackCtx *callbackData) error {
+func cleanupOnCreateTimeout(ctx context.Context, atlasClient *admin.APIClient, callbackCtx *callbackData) error {
 	if !callbackCtx.DeleteOnCreateTimeout {
 		return nil
 	}
 
 	_, err := atlasClient.StreamsApi.DeleteStreamProcessor(ctx, callbackCtx.ProjectID, callbackCtx.WorkspaceOrInstanceName, callbackCtx.ProcessorName).Execute()
 	if err != nil {
-		// Log but don't fail - cleanup is best effort
 		_, _ = logger.Warnf("Cleanup delete failed: %v", err)
 	}
 	return nil
 }
 
 func Create(req handler.Request, prevModel *Model, currentModel *Model) (handler.ProgressEvent, error) {
-	// Initial create: full validation and initialization
 	atlasClient, peErr := initEnvWithLatestClient(req, currentModel, CreateRequiredFields)
 	if peErr != nil {
 		return *peErr, nil
@@ -243,7 +255,6 @@ func Create(req handler.Request, prevModel *Model, currentModel *Model) (handler
 	projectID := util.SafeString(currentModel.ProjectId)
 	processorName := util.SafeString(currentModel.ProcessorName)
 
-	// Initial create - validate state if provided
 	var needsStarting bool
 	if currentModel.State != nil {
 		state := *currentModel.State
@@ -260,7 +271,6 @@ func Create(req handler.Request, prevModel *Model, currentModel *Model) (handler
 		}
 	}
 
-	// Initial create - create the stream processor
 	streamProcessorReq, err := NewStreamProcessorReq(currentModel)
 	if err != nil {
 		return handler.ProgressEvent{
@@ -274,22 +284,27 @@ func Create(req handler.Request, prevModel *Model, currentModel *Model) (handler
 		return handleError(apiResp, constants.CREATE, err)
 	}
 
-	// Get timeout configuration
 	timeoutStr := ""
 	if currentModel.Timeouts != nil && currentModel.Timeouts.Create != nil {
 		timeoutStr = *currentModel.Timeouts.Create
 	}
 
-	deleteOnCreateTimeout := true // Default to true like Terraform
+	deleteOnCreateTimeout := true
 	if currentModel.DeleteOnCreateTimeout != nil {
 		deleteOnCreateTimeout = *currentModel.DeleteOnCreateTimeout
 	}
 
-	// Return InProgress to wait for CREATED state
+	inProgressModel := &Model{}
+	if currentModel != nil {
+		*inProgressModel = *currentModel
+		inProgressModel.DeleteOnCreateTimeout = nil
+	}
+	copyIdentifyingFields(inProgressModel, currentModel)
+
 	return handler.ProgressEvent{
 		OperationStatus:      handler.InProgress,
 		Message:              "Creating stream processor",
-		ResourceModel:        currentModel,
+		ResourceModel:        inProgressModel,
 		CallbackDelaySeconds: defaultCallbackDelaySeconds,
 		CallbackContext: buildCallbackContext(projectID, workspaceOrInstanceName, processorName, map[string]any{
 			"needsStarting":         needsStarting,
@@ -300,12 +315,10 @@ func Create(req handler.Request, prevModel *Model, currentModel *Model) (handler
 	}, nil
 }
 
-func handleCreateCallback(ctx context.Context, atlasClient *admin20250312010.APIClient, currentModel *Model, callbackCtx *callbackData) (handler.ProgressEvent, error) {
+func handleCreateCallback(ctx context.Context, atlasClient *admin.APIClient, currentModel *Model, callbackCtx *callbackData) (handler.ProgressEvent, error) {
 	needsStarting := callbackCtx.NeedsStarting
 
-	// Check for timeout
 	if isTimeoutExceeded(callbackCtx.StartTime, callbackCtx.TimeoutDuration) {
-		// Timeout occurred - handle cleanup if enabled
 		if err := cleanupOnCreateTimeout(context.Background(), atlasClient, callbackCtx); err != nil {
 			return handler.ProgressEvent{
 				OperationStatus: handler.Failed,
@@ -339,26 +352,20 @@ func handleCreateCallback(ctx context.Context, atlasClient *admin20250312010.API
 		"deleteOnCreateTimeout": callbackCtx.DeleteOnCreateTimeout,
 	})
 
-	// State-based logic: current state tells us what to do next
 	switch currentState {
 	case CreatedState:
 		if needsStarting {
-			// Start the processor
 			if peErr := startStreamProcessor(ctx, atlasClient, callbackCtx.ProjectID, callbackCtx.WorkspaceOrInstanceName, callbackCtx.ProcessorName); peErr != nil {
 				return *peErr, nil
 			}
-			// Continue waiting for STARTED state
 			return createInProgressEvent("Starting stream processor", currentModel, callbackContext), nil
 		}
-		// No need to start, we're done
-		return finalizeModel(streamProcessor, currentModel, "Create Complete")
+		return finalizeModel(streamProcessor, currentModel, "Create Completed")
 
 	case StartedState:
-		// Already started, we're done
-		return finalizeModel(streamProcessor, currentModel, "Create Complete")
+		return finalizeModel(streamProcessor, currentModel, "Create Completed")
 
 	case InitiatingState, CreatingState:
-		// Still creating, continue waiting
 		return createInProgressEvent(fmt.Sprintf("Creating stream processor (current state: %s)", currentState), currentModel, callbackContext), nil
 
 	case FailedState:
@@ -375,8 +382,7 @@ func handleCreateCallback(ctx context.Context, atlasClient *admin20250312010.API
 	}
 }
 
-// finalizeModel converts the stream processor to a model and returns a success event
-func finalizeModel(streamProcessor *admin20250312010.StreamsProcessorWithStats, currentModel *Model, message string) (handler.ProgressEvent, error) {
+func finalizeModel(streamProcessor *admin.StreamsProcessorWithStats, currentModel *Model, message string) (handler.ProgressEvent, error) {
 	resourceModel, err := GetStreamProcessorModel(streamProcessor, currentModel)
 	if err != nil {
 		return handler.ProgressEvent{
@@ -412,15 +418,13 @@ func Read(req handler.Request, prevModel *Model, currentModel *Model) (handler.P
 	processorName := util.SafeString(currentModel.ProcessorName)
 
 	streamProcessor, apiResp, err := atlasClient.StreamsApi.GetStreamProcessorWithParams(context.Background(),
-		&admin20250312010.GetStreamProcessorApiParams{
+		&admin.GetStreamProcessorApiParams{
 			GroupId:       projectID,
 			TenantName:    workspaceOrInstanceName,
 			ProcessorName: processorName,
 		}).Execute()
 	if err != nil {
 		if apiResp != nil && apiResp.StatusCode == http.StatusNotFound {
-			// Note: Terraform removes resource from state on 404, but CloudFormation doesn't support state removal
-			// Return NotFound error (CloudFormation will handle this appropriately)
 			return handler.ProgressEvent{
 				OperationStatus:  handler.Failed,
 				Message:          "Resource not found",
@@ -442,13 +446,12 @@ func Read(req handler.Request, prevModel *Model, currentModel *Model) (handler.P
 
 	return handler.ProgressEvent{
 		OperationStatus: handler.Success,
-		Message:         "Read Complete",
+		Message:         "Read Completed",
 		ResourceModel:   resourceModel,
 	}, nil
 }
 
 func Update(req handler.Request, prevModel *Model, currentModel *Model) (handler.ProgressEvent, error) {
-	// Initial update: full validation and initialization
 	atlasClient, peErr := initEnvWithLatestClient(req, currentModel, UpdateRequiredFields)
 	if peErr != nil {
 		return *peErr, nil
@@ -480,7 +483,6 @@ func Update(req handler.Request, prevModel *Model, currentModel *Model) (handler
 	projectID := util.SafeString(currentModel.ProjectId)
 	processorName := util.SafeString(currentModel.ProcessorName)
 
-	// Initial update - determine planned state (default to previous state if not specified)
 	plannedState := CreatedState
 	if currentModel.State != nil && *currentModel.State != "" {
 		plannedState = *currentModel.State
@@ -488,21 +490,26 @@ func Update(req handler.Request, prevModel *Model, currentModel *Model) (handler
 		plannedState = *prevModel.State
 	}
 
-	// Initial update - get current state
-	requestParams := &admin20250312010.GetStreamProcessorApiParams{
+	requestParams := &admin.GetStreamProcessorApiParams{
 		GroupId:       projectID,
 		TenantName:    workspaceOrInstanceName,
 		ProcessorName: processorName,
 	}
 
-	currentStreamProcessor, _, err := atlasClient.StreamsApi.GetStreamProcessorWithParams(ctx, requestParams).Execute()
+	currentStreamProcessor, apiResp, err := atlasClient.StreamsApi.GetStreamProcessorWithParams(ctx, requestParams).Execute()
 	if err != nil {
-		return handleError(nil, constants.READ, err)
+		if apiResp != nil && apiResp.StatusCode == http.StatusNotFound {
+			return handler.ProgressEvent{
+				OperationStatus:  handler.Failed,
+				Message:          "Resource not found",
+				HandlerErrorCode: "NotFound",
+			}, nil
+		}
+		return handleError(apiResp, constants.READ, err)
 	}
 
 	currentState := currentStreamProcessor.GetState()
 
-	// Validate state transition
 	if errMsg, isValid := validateUpdateStateTransition(currentState, plannedState); !isValid {
 		return handler.ProgressEvent{
 			OperationStatus: handler.Failed,
@@ -510,10 +517,9 @@ func Update(req handler.Request, prevModel *Model, currentModel *Model) (handler
 		}, nil
 	}
 
-	// Stop the processor if it's currently started
 	if currentState == StartedState {
 		_, err := atlasClient.StreamsApi.StopStreamProcessorWithParams(ctx,
-			&admin20250312010.StopStreamProcessorApiParams{
+			&admin.StopStreamProcessorApiParams{
 				GroupId:       projectID,
 				TenantName:    workspaceOrInstanceName,
 				ProcessorName: processorName,
@@ -526,11 +532,17 @@ func Update(req handler.Request, prevModel *Model, currentModel *Model) (handler
 			}, nil
 		}
 
-		// Return InProgress to wait for STOPPED state
+		inProgressModel := &Model{}
+		if currentModel != nil {
+			*inProgressModel = *currentModel
+			inProgressModel.DeleteOnCreateTimeout = nil
+		}
+		copyIdentifyingFields(inProgressModel, currentModel)
+
 		return handler.ProgressEvent{
 			OperationStatus:      handler.InProgress,
 			Message:              "Stopping stream processor",
-			ResourceModel:        currentModel,
+			ResourceModel:        inProgressModel,
 			CallbackDelaySeconds: defaultCallbackDelaySeconds,
 			CallbackContext: buildCallbackContext(projectID, workspaceOrInstanceName, processorName, map[string]any{
 				"plannedState": plannedState,
@@ -552,10 +564,9 @@ func Update(req handler.Request, prevModel *Model, currentModel *Model) (handler
 		return handleError(apiResp, constants.UPDATE, err)
 	}
 
-	// Start the processor if the desired state is started
 	if plannedState == StartedState {
 		_, err := atlasClient.StreamsApi.StartStreamProcessorWithParams(ctx,
-			&admin20250312010.StartStreamProcessorApiParams{
+			&admin.StartStreamProcessorApiParams{
 				GroupId:       projectID,
 				TenantName:    workspaceOrInstanceName,
 				ProcessorName: processorName,
@@ -568,11 +579,17 @@ func Update(req handler.Request, prevModel *Model, currentModel *Model) (handler
 			}, nil
 		}
 
-		// Return InProgress to wait for STARTED state
+		inProgressModel := &Model{}
+		if currentModel != nil {
+			*inProgressModel = *currentModel
+			inProgressModel.DeleteOnCreateTimeout = nil
+		}
+		copyIdentifyingFields(inProgressModel, currentModel)
+
 		return handler.ProgressEvent{
 			OperationStatus:      handler.InProgress,
 			Message:              "Starting stream processor",
-			ResourceModel:        currentModel,
+			ResourceModel:        inProgressModel,
 			CallbackDelaySeconds: defaultCallbackDelaySeconds,
 			CallbackContext: buildCallbackContext(projectID, workspaceOrInstanceName, processorName, map[string]any{
 				"plannedState": plannedState,
@@ -580,15 +597,14 @@ func Update(req handler.Request, prevModel *Model, currentModel *Model) (handler
 		}, nil
 	}
 
-	// Update complete, no state change needed
-	return finalizeModel(streamProcessorResp, currentModel, "Update Complete")
+	return finalizeModel(streamProcessorResp, currentModel, "Update Completed")
 }
 
 func List(req handler.Request, prevModel *Model, currentModel *Model) (handler.ProgressEvent, error) {
 	return handler.ProgressEvent{}, errors.New("not implemented: list")
 }
 
-func handleUpdateCallback(ctx context.Context, atlasClient *admin20250312010.APIClient, currentModel *Model, callbackCtx *callbackData) (handler.ProgressEvent, error) {
+func handleUpdateCallback(ctx context.Context, atlasClient *admin.APIClient, currentModel *Model, callbackCtx *callbackData) (handler.ProgressEvent, error) {
 	plannedState := callbackCtx.PlannedState
 	if plannedState == "" {
 		plannedState = CreatedState // Default
@@ -606,11 +622,8 @@ func handleUpdateCallback(ctx context.Context, atlasClient *admin20250312010.API
 		"plannedState": plannedState,
 	})
 
-	// State-based logic: current state tells us what to do next
 	switch currentState {
 	case StoppedState, CreatedState:
-		// Processor is stopped/created, check if we need to update or start
-		// If we're here from a callback, we likely just stopped it, so update it
 		modifyAPIRequestParams, err := NewStreamProcessorUpdateReq(currentModel)
 		if err != nil {
 			return handler.ProgressEvent{
@@ -624,27 +637,34 @@ func handleUpdateCallback(ctx context.Context, atlasClient *admin20250312010.API
 			return handleError(apiResp, constants.UPDATE, err)
 		}
 
-		// Start if needed
 		if plannedState == StartedState {
 			if peErr := startStreamProcessor(ctx, atlasClient, callbackCtx.ProjectID, callbackCtx.WorkspaceOrInstanceName, callbackCtx.ProcessorName); peErr != nil {
 				return *peErr, nil
 			}
-			// Continue waiting for STARTED state
 			return createInProgressEvent("Starting stream processor", currentModel, callbackContext), nil
 		}
 
-		// Update complete, no state change needed
-		return finalizeModel(streamProcessorResp, currentModel, "Update Complete")
+		return finalizeModel(streamProcessorResp, currentModel, "Update Completed")
 
 	case StartedState:
-		// Already in desired state (if plannedState is STARTED) or need to stop first
 		if plannedState == StartedState {
-			// Already started, update complete
-			return finalizeModel(streamProcessor, currentModel, "Update Complete")
+			modifyAPIRequestParams, err := NewStreamProcessorUpdateReq(currentModel)
+			if err != nil {
+				return handler.ProgressEvent{
+					OperationStatus: handler.Failed,
+					Message:         fmt.Sprintf("Error creating update request: %s", err.Error()),
+				}, nil
+			}
+
+			streamProcessorResp, apiResp, err := atlasClient.StreamsApi.UpdateStreamProcessorWithParams(ctx, modifyAPIRequestParams).Execute()
+			if err != nil {
+				return handleError(apiResp, constants.UPDATE, err)
+			}
+
+			return finalizeModel(streamProcessorResp, currentModel, "Update Completed")
 		}
-		// Need to stop first - actually stop it to avoid infinite loop
 		_, err := atlasClient.StreamsApi.StopStreamProcessorWithParams(ctx,
-			&admin20250312010.StopStreamProcessorApiParams{
+			&admin.StopStreamProcessorApiParams{
 				GroupId:       callbackCtx.ProjectID,
 				TenantName:    callbackCtx.WorkspaceOrInstanceName,
 				ProcessorName: callbackCtx.ProcessorName,
@@ -656,7 +676,6 @@ func handleUpdateCallback(ctx context.Context, atlasClient *admin20250312010.API
 				Message:         fmt.Sprintf("Error stopping stream processor: %s", err.Error()),
 			}, nil
 		}
-		// Continue waiting for STOPPED state
 		return createInProgressEvent("Stopping stream processor", currentModel, callbackContext), nil
 
 	case FailedState:
@@ -666,13 +685,11 @@ func handleUpdateCallback(ctx context.Context, atlasClient *admin20250312010.API
 		}, nil
 
 	default:
-		// Still transitioning (e.g., from STARTED to STOPPED)
 		return createInProgressEvent(fmt.Sprintf("Updating stream processor (current state: %s)", currentState), currentModel, callbackContext), nil
 	}
 }
 
 func Delete(req handler.Request, prevModel *Model, currentModel *Model) (handler.ProgressEvent, error) {
-	// Initial delete: full validation and initialization
 	atlasClient, peErr := initEnvWithLatestClient(req, currentModel, DeleteRequiredFields)
 	if peErr != nil {
 		return *peErr, nil
@@ -690,29 +707,29 @@ func Delete(req handler.Request, prevModel *Model, currentModel *Model) (handler
 	projectID := util.SafeString(currentModel.ProjectId)
 	processorName := util.SafeString(currentModel.ProcessorName)
 
-	// Delete the processor (no verification callbacks - matches Terraform behavior)
-	_, err = atlasClient.StreamsApi.DeleteStreamProcessor(ctx, projectID, workspaceOrInstanceName, processorName).Execute()
+	apiResp, err := atlasClient.StreamsApi.DeleteStreamProcessor(ctx, projectID, workspaceOrInstanceName, processorName).Execute()
 	if err != nil {
-		// Treat 404 as error (matches Terraform behavior)
+		if apiResp != nil && apiResp.StatusCode == http.StatusNotFound {
+			return handler.ProgressEvent{
+				OperationStatus:  handler.Failed,
+				Message:          "Resource not found",
+				HandlerErrorCode: "NotFound",
+			}, nil
+		}
 		return handler.ProgressEvent{
 			OperationStatus: handler.Failed,
 			Message:         fmt.Sprintf("Error deleting stream processor: %s", err.Error()),
 		}, nil
 	}
 
-	// Return success immediately (no verification - matches Terraform)
 	return handler.ProgressEvent{
 		OperationStatus: handler.Success,
-		Message:         "Delete Complete",
+		Message:         "Delete Completed",
 	}, nil
 }
 
-// Helper functions for callback-based state management
-
-// getStreamProcessor retrieves a stream processor and handles errors
-// Returns (processor, progressEvent) where progressEvent is nil on success
-func getStreamProcessor(ctx context.Context, atlasClient *admin20250312010.APIClient, projectID, workspaceOrInstanceName, processorName string) (*admin20250312010.StreamsProcessorWithStats, *handler.ProgressEvent) {
-	requestParams := &admin20250312010.GetStreamProcessorApiParams{
+func getStreamProcessor(ctx context.Context, atlasClient *admin.APIClient, projectID, workspaceOrInstanceName, processorName string) (*admin.StreamsProcessorWithStats, *handler.ProgressEvent) {
+	requestParams := &admin.GetStreamProcessorApiParams{
 		GroupId:       projectID,
 		TenantName:    workspaceOrInstanceName,
 		ProcessorName: processorName,
@@ -722,8 +739,9 @@ func getStreamProcessor(ctx context.Context, atlasClient *admin20250312010.APICl
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			return nil, &handler.ProgressEvent{
-				OperationStatus: handler.Failed,
-				Message:         "Stream processor not found",
+				OperationStatus:  handler.Failed,
+				Message:          "Stream processor not found",
+				HandlerErrorCode: "NotFound",
 			}
 		}
 		return nil, &handler.ProgressEvent{
@@ -734,11 +752,9 @@ func getStreamProcessor(ctx context.Context, atlasClient *admin20250312010.APICl
 	return streamProcessor, nil
 }
 
-// startStreamProcessor starts a stream processor and handles errors
-// Returns progressEvent which is nil on success
-func startStreamProcessor(ctx context.Context, atlasClient *admin20250312010.APIClient, projectID, workspaceOrInstanceName, processorName string) *handler.ProgressEvent {
+func startStreamProcessor(ctx context.Context, atlasClient *admin.APIClient, projectID, workspaceOrInstanceName, processorName string) *handler.ProgressEvent {
 	_, err := atlasClient.StreamsApi.StartStreamProcessorWithParams(ctx,
-		&admin20250312010.StartStreamProcessorApiParams{
+		&admin.StartStreamProcessorApiParams{
 			GroupId:       projectID,
 			TenantName:    workspaceOrInstanceName,
 			ProcessorName: processorName,
@@ -753,18 +769,23 @@ func startStreamProcessor(ctx context.Context, atlasClient *admin20250312010.API
 	return nil
 }
 
-// createInProgressEvent creates a standardized InProgress event
 func createInProgressEvent(message string, currentModel *Model, callbackContext map[string]any) handler.ProgressEvent {
+	inProgressModel := &Model{}
+	if currentModel != nil {
+		*inProgressModel = *currentModel
+		inProgressModel.DeleteOnCreateTimeout = nil
+	}
+	copyIdentifyingFields(inProgressModel, currentModel)
+
 	return handler.ProgressEvent{
 		OperationStatus:      handler.InProgress,
 		Message:              message,
-		ResourceModel:        currentModel,
+		ResourceModel:        inProgressModel,
 		CallbackDelaySeconds: defaultCallbackDelaySeconds,
 		CallbackContext:      callbackContext,
 	}
 }
 
-// validateUpdateStateTransition validates if a state transition is allowed
 func validateUpdateStateTransition(currentState, plannedState string) (errMsg string, isValidTransition bool) {
 	if currentState == plannedState {
 		return "", true
@@ -782,8 +803,7 @@ func validateUpdateStateTransition(currentState, plannedState string) (errMsg st
 }
 
 func handleError(response *http.Response, method constants.CfnFunctions, err error) (handler.ProgressEvent, error) {
-	errMsg := fmt.Sprintf("%s error: %s", method, err.Error())
-	_, _ = logger.Warn(errMsg)
+	errMsg := fmt.Sprintf("%s error:%s", method, err.Error())
 
 	if response != nil && response.StatusCode == http.StatusConflict {
 		return handler.ProgressEvent{
